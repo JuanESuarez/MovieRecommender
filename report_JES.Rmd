@@ -1,0 +1,748 @@
+---
+title: "Movielens Recommendation Project"
+author: "Juan Eloy Suarez - PH125 Data Science - Harvard"
+date: "16/May/2021"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, error = TRUE, warning=FALSE)
+```
+
+## 1 Introduction
+### Executive Summary
+In this project, we want to create a movie recommendation system. More specifically, we need to predict the value an user will rate a movie in a test set we will use for validation, based on a given set of users and movie ratings. 
+
+Our data is from the MovieLens 10M dataset (10 million ratings). According to the definition of the challenge, we have a training dataset `edx` of approximately 9 million records, and a test dataset `validation` of 1 million records. The true rating column in the validation set will be used to compare the predictions of the model, which will me measured according to its `RMSE` (Root Min Square Error).
+
+The prediction algorithm used in this project departs from the basic approach used in the course (Bellkor’s approach), consisting in applying to the generic average prediction an user and a movie _bias_ (statistical effect) for each observation to predict, which is regularized for prevalence compensation.
+
+However, our modelling adds some originality to enrich this approach:
+
+* Calculates, includes and **regularizes biases for Genre/s and Year** of the movie
+* Extracts **Sentiments induced from Title** of each movie and includes and regularizes also their bias
+* **Ensembles a second model** that, using first model predictions as input, improves prediction by including biases related with the **moment when rating is done**, i.e. **Weekday**, **Month** and year between rating and movie release (**Age-At-Rating**). *Note this second model is sequential with first one, so it could be discarded if no rating moment available for prediction, and reaching anyway a good enough RMSE.*
+
+We payed special attention to __ensure that test data are never used for training the model, or even estimating parameters__ as $\lambda$ for regularization. For this reason, we create a `sub-partitions` for parameter training and test, extracted exclusively from the training set (`edx`).
+
+With all of this, an already acceptable RMSE of **0.8643** is achieved already by first model, and improved by second model up to **0.8639**.
+
+## 2 Data Exploration
+
+### Preparation of environment, train&test partition
+First of all, we need to initialize environment, install required packages and download dataframes `ratings` and `movies`:
+```{r prepareEnvironment1, message=FALSE, include=FALSE}
+##########################################################
+# Initialize environment
+##########################################################
+
+if(!require(tidyverse)) install.packages("tidyverse", repos = "http://cran.us.r-project.org")
+if(!require(caret)) install.packages("caret", repos = "http://cran.us.r-project.org")
+if(!require(data.table)) install.packages("data.table", repos = "http://cran.us.r-project.org")
+
+if(!require(lubridate)) install.packages("lubridate", repos = "http://cran.us.r-project.org")
+if(!require(tidytext)) install.packages("tidytext", repos = "http://cran.us.r-project.org")
+if(!require(textdata)) install.packages("textdata", repos = "http://cran.us.r-project.org")
+
+library(tidyverse)
+library(data.table)
+
+library(dslabs)
+library(lubridate)
+library(tidytext) # For sentiment analysis
+library(ggrepel)
+library(ggplot2)
+library(ggthemes)
+library(gridExtra)
+
+options(digits=5)
+
+Sys.setlocale("LC_TIME", "english")
+
+##########################################################
+# Create edx set, validation set (final hold-out test set)
+##########################################################
+
+# MovieLens 10M dataset:
+# https://grouplens.org/datasets/movielens/10m/
+# http://files.grouplens.org/datasets/movielens/ml-10m.zip
+
+dl <- tempfile()
+download.file("http://files.grouplens.org/datasets/movielens/ml-10m.zip", dl)
+
+ratings <- fread(text = gsub("::", "\t", readLines(unzip(dl, "ml-10M100K/ratings.dat"))),
+                 col.names = c("userId", "movieId", "rating", "timestamp"))
+
+movies <- str_split_fixed(readLines(unzip(dl, "ml-10M100K/movies.dat")), "\\::", 3)
+colnames(movies) <- c("movieId", "title", "genres")
+
+# if using R 4.0 or later:
+movies <- as.data.frame(movies) %>% mutate(movieId = as.numeric(movieId),
+                                           title = as.character(title),
+                                           genres = as.character(genres))
+
+```
+
+```{r namesMoviesRatings, echo=TRUE, message=FALSE, warning=FALSE}
+names(ratings)
+names(movies)
+```
+
+In preparation for later use, we extract as new prescriptor the Release Year information contained in brackets in the title of each movie:
+
+```{r extractYear, echo=TRUE}
+# Separating Year form title to get a new prescriptor
+movies <- movies %>% 
+  mutate (year=as.numeric(str_match(title, "(^.*)\\s[(](\\d{4})[)]$")[,3]), 
+          title=str_match(title, "(^.*)\\s[(](\\d{4})[)]$")[,2])
+```
+
+Once prepared data we need, we create the train (`edx`) and test (`validation`) separated partitions based on `movielens` data:
+
+```{r prepareEnvironment2, message=FALSE, warning=FALSE, include=FALSE}
+movielens <- left_join(ratings, movies, by = "movieId")
+# Validation set will be 10% of MovieLens data
+set.seed(1, sample.kind="Rounding")
+test_index <- createDataPartition(y = movielens$rating, times = 1, p = 0.1, list = FALSE)
+edx <- movielens[-test_index,]
+
+temp <- movielens[test_index,]
+
+# Make sure userId and movieId in validation set are also in edx set
+validation <- temp %>%
+  semi_join(edx, by = "movieId") %>%
+  semi_join(edx, by = "userId")
+
+# Add rows removed from validation set back into edx set
+removed <- anti_join(temp, validation)
+edx <- rbind(edx, removed)
+rm(dl, ratings, movies, test_index, temp, removed, movielens)
+```
+
+```{r showEdx, echo=FALSE, message=FALSE, warning=FALSE}
+names(edx)
+```
+
+This analysis will make use of the root mean-square error (RMSE). We need to create a function to be called and calculate RMSE for each one of the models we are going to test. We will also calculate the global average of rating, which will be useful as starting point of our analysis and modelling:
+
+```{r calculateRMSE, include=TRUE}
+# Function to calculate RMSE
+RMSE <- function(true_ratings, predicted_ratings){
+  sqrt(mean((true_ratings - predicted_ratings)^2))
+}
+# Average of all ratings
+mu <- mean(edx$rating)
+```
+
+### Understanding the data
+Exploration of the dataset shows a dataframe that contains all ratings (numbers between 0.5 and 5 in intervals of 0.5) made by users to movies. Dataset includes also information about the movie and the transaction timestamp, that we’ll convert in date using `lubridate` package. Year is originally included in the title, so we extracted it into a different feature.
+```{r showNames}
+str(edx)
+```
+There are three sources of information for our exploratory analysis:
+
+* User-related information (ratings by users)
+* Movie-related information (ratings received, title, genre, release year)
+* Rating-related information (when exactly rating transaction happens)
+
+### User related data
+
+```{r showN, message=FALSE, warning=FALSE, include=FALSE}
+nUsers_nMovies <- edx %>% summarize(n_users = n_distinct(userId), n_movies = n_distinct(movieId))
+```
+
+Total number of users is `r nUsers_nMovies[1]` and movies is `r nUsers_nMovies[2]`
+
+```{r userrHistogram, echo=FALSE, message=FALSE, warning=FALSE}
+# USER effect
+byUser_ratings <- edx %>%
+  group_by(userId) %>%
+  summarize(rating = mean(rating), b_u_resid = rating - mu)
+# Visualize histogram
+byUser_ratings %>%
+  filter(n()>=100) %>%
+  ggplot(aes(rating)) +
+  geom_histogram(bins = 30, color = "black")
+```
+
+Distribution of user’s ratings is around an average of **mu**=`r mu`, with a standard deviation of `r sd(edx$rating)`, and we see an approximate normal distribution of the ratings by user in the QQ-Plot:
+
+```{r qq, echo=TRUE}
+# Normality test by user
+qqnorm(byUser_ratings$rating, pch = 1, frame = FALSE)
+qqline(byUser_ratings$rating, col = "steelblue", lwd = 2)
+```
+
+Distribution of all ratings per rating category shows us this pattern: 
+
+```{r echo=FALSE, chartDistPerCategory, echo=FALSE}
+edx %>% ggplot(aes(x = rating)) +
+  geom_histogram(bins = 30, color = "black") +
+  ggtitle("Distribution of all ratings (in millions)") +
+  ylab(element_blank()) + 
+  xlab("Rating") + xlim(0,NA) + 
+  scale_y_continuous(labels=function(x)x/1000000) +# in millions
+  theme(legend.position = "none",
+        panel.grid = element_blank(),
+        axis.text.x = element_text(color="blue", size=14, face="bold"),
+        axis.text.y = element_text(color="blue", size=14, face="bold"))
+```
+
+### Movie related data
+Dataset contains interesting information on how rating depends on the movie. Looking in detail at the prescriptors we have related with the movie, we can obtain some interesting insights.
+The MOVIE bias consists in a generic “quality” effect that we can assign to each movie. It can be estimated by the mean of all ratings received by that movie, and we can use it to refine the generic prediction.
+
+```{r showByMovieRatings, echo=TRUE, message=FALSE, warning=FALSE}
+byMovie_ratings <- edx %>% 
+  group_by(movieId) %>%
+  summarize(rating=mean(rating), Residual = mean(rating - mu))
+head(byMovie_ratings)
+```
+
+Now, we have each movie assigned to a single rating that is calculated as the average of all ratings to that movie:
+
+```{r showMu, echo=TRUE}
+mu_byMovie <- mean(byMovie_ratings$rating)  # Average of ratings movie to movie
+```
+
+We see now that the average of these movie averages `r mu_byMovie` is significantly less that the direct average of all ratings $\mu$. Interpretation of this is that there is a significant difference in the number of ratings each movie receives (prevalence), and movies with many ratings tend to have higher ratings. This effect can be also deducted from the analysis of residual ratings (vs. $\mu$) of the movie’s ratings, where we see an unbalanced-to-left distribution:
+
+```{r histDevs, echo=FALSE, error=TRUE}
+qplot(Residual, geom ="histogram", bins = 10, data = byMovie_ratings, color = I("black"))
+```
+
+Above variability on prevalence recommends we use regularization to compensate too big differences of number of ratings per movie.
+
+The YEAR a movie was released seems to have some influence in the rating a movie gets, so we can consider this year-effect as an added bias to apply (discount) when building our model.
+
+```{r byYearRatings, echo=FALSE, message=FALSE, warning=FALSE}
+# YEAR bias
+byYear_ratings <- edx %>%
+  group_by(Year = year) %>%
+  summarize(Residual = mean(rating) - mu, n = n(), Percent=100*Residual/mu) %>%
+  filter(!is.na(year)) %>%
+  arrange(desc(abs(Residual)))
+# byYear_ratings
+# Visualize diff. percents over the movie's years
+byYear_ratings %>% filter(abs(Residual)<1.5) %>%
+  ggplot(aes(Year, Percent, color=n)) +
+  geom_point(size = 3) +
+  geom_hline(yintercept=0, linetype="dashed", color = "orange", size=2) +
+  geom_smooth(method = "lm")
+```
+
+We see outliers in some years with few ratings, but also a trend overtime to rate lower to more recent movies, even considering these years have many more ratings. Again, a regularization is recommended to compensate this effect and isolate, as much as possible the bias we clearly see associated to the year a movie was released.
+
+Our dataset includes, associated to each movie, the list of GENRES it is assigned to. In order to be more precise we’ll use this code to extract specific gender/s by movie, instead of the list.
+
+```{r byGenre, echo=TRUE, message=FALSE, warning=FALSE}
+# GENRE (individualized) bias
+tmp <- setNames(strsplit(as.character(edx$genres), split = "[|]"), edx$rating)
+indiv_genres <- data.frame(genre = unlist(tmp), rating = as.numeric(as.character(rep(names(tmp), sapply(tmp, length)))), row.names = NULL)
+byIndivGenre_ratings <- indiv_genres %>%
+  group_by(genre) %>%
+  summarize(b_g = mean(rating) - mu, n=n(), Percent=100*b_g/mu) %>%
+  mutate(genre=reorder(genre,b_g,FUN=median)) %>%
+  arrange(desc(abs(Percent)))
+rm(tmp, indiv_genres)
+# byIndivGenre_ratings
+```
+
+This clearly shows a genre-bias exist:
+
+```{r chartGenre, echo=FALSE}
+# We are visualizing movies based on their genre
+byIndivGenre_ratings %>%
+  ggplot(aes(genre, Percent, size=n)) +
+  geom_point(color="blue") +
+  geom_hline(yintercept=0, linetype="dashed", color = "orange", size=2) +
+  geom_label_repel(aes(label = genre),
+                   label.size = NA,
+                   fill = "transparent",
+                   box.padding   = 0.65,
+                   point.padding = 0.5,
+                   segment.color = 'grey50') +
+  ggtitle("Ratings of movies of a genre") +
+  xlab(element_blank()) +
+  ylab("% diff") +
+  theme(legend.position = "none",
+        panel.grid = element_blank(),
+        axis.text.x = element_blank(),
+        axis.text.y = element_text(color="blue", size=14, face="bold"))
+```
+
+Variability in prevalence also recommends us here to regularize when applying this bias. 
+
+Now, we will go one step further and use the TITLE of the movie as prescriptor. It seems clear that just the title is not a significant or useful source of bias or causation; however, we will convert this wording in SENTIMENTS. This means that some words can be associated to sentiments or emotions, that we can associate a movie. Then, maybe this title-sentiment characteristic of the movie could be a bias we apply. I.e. are movies containing words like “dead”, “murder” higher rated that others containing “happiness” o “luck”?
+For exploring this, we will use lexicons to convert words in title into sentiments and link it to ratings. This code performs it based on public `lexicons`:
+
+```{r calcSentiments, echo=TRUE, message=FALSE, warning=FALSE}
+# Sentiments based on TITLE bias
+# Extracting words contained in each movie's title
+pattern <- "([^A-Za-z\\d#@']|'(?![A-Za-z\\d#@]))"
+movie_words <- edx %>%
+  group_by(movieId) %>%
+  summarize(title = first(title), rating=mean(rating)) %>%
+  mutate(title = str_replace_all(title, "[(+)]", ""))  %>%
+  unnest_tokens(word, title, token = "regex", pattern = pattern) %>%
+  select(movieId, word, rating)
+# Specific lexicons to try
+# Identifies EMOTIONS (NRC) : {anger, anticipation, disgust, fear, joy, negative, positive, sadness, surprise, trust}:
+myLexicon_nrc <- get_sentiments("nrc") %>% select(word, sentiment)
+# Identifies LEVELS (BING): {positive, negative}:
+myLexicon_bing <- get_sentiments("bing") %>% select(word, sentiment)
+# Calculate ratings of moving containing a specific sentiment based on NRC Lexicon
+bySentiment_ratings_nrc <- movie_words %>%
+  inner_join(myLexicon_nrc, by = "word") %>%
+  group_by(sentiment) %>%
+  summarize(b_sr = mean(rating)-mu_byMovie, n=n()) %>%
+  mutate(sentiment=reorder(sentiment,b_sr,FUN=median), Percent=100*b_sr/mu_byMovie)
+# Calculate ratings of moving containing a specific sentiment based on BING Lexicon
+bySentiment_ratings_bing <- movie_words %>%
+  inner_join(myLexicon_bing, by = "word") %>%
+  group_by(sentiment) %>%
+  summarize(Residual = mean(rating)-mu_byMovie, n=n()) %>%
+  mutate(sentiment=reorder(sentiment,Residual,FUN=median), Percent=100*Residual/mu_byMovie)
+```
+
+We visualize differences:
+
+```{r chartSentimentNRC, echo=FALSE}
+# Visualize NRC sentiments ratings bias
+chartbySentiment_ratings_nrc <- bySentiment_ratings_nrc %>%
+  ggplot(aes(sentiment, Percent, size=n)) +
+  geom_point(color = "blue") +
+  geom_hline(yintercept=0, linetype="dashed", color = "orange", size=2) +
+  geom_label_repel(aes(label = sentiment),
+                   label.size = NA,
+                   fill = "transparent",
+                   box.padding   = 0.65,
+                   point.padding = 0.5,
+                   segment.color = 'grey50') +
+  ggtitle("Rating of movies inspiring a sentiment in the title") +
+  xlab(element_blank()) +
+  ylab("% diff.") +
+  theme(legend.position = "none",
+        panel.grid = element_blank(),
+        axis.text.x = element_blank(),
+        axis.text.y = element_text(color="blue", size=14, face="bold"))
+chartbySentiment_ratings_nrc
+```
+
+When applying just positive/negative sentiment we get also a bias:
+
+```{r listSentimentBING, echo=FALSE}
+bySentiment_ratings_bing
+```
+
+We will now calculate impact of all sentiments detected per movie. For simplification, and looking at its significance, we use positive/negative lexicon, by summarizing all +1 for positives or -1 for negatives.
+
+```{r applySentimentMovie, echo=TRUE, message=FALSE, warning=FALSE}
+# To apply to each movie, we summarize per movie positive or negative sentiments detected
+byMovie_SentimentEffect <-
+  (movie_words %>% inner_join(myLexicon_bing, by = "word")) %>%
+  left_join(bySentiment_ratings_bing, id = "sentiment") %>%
+  mutate(weight=if_else(sentiment=="negative", -1, 1)) %>%
+  group_by(movieId) %>%
+  summarize(weightSentiment = sum(weight))
+head(byMovie_SentimentEffect)
+```
+
+We observe differences for some specific sentiments, when present, and in general a behavior where negative detected sentiments penalize the rating of a movie. 
+Our summarization per movie results in a range from very negative (many more negatives than positives in title), to very positive. 
+
+```{r rangeSentiments, echo=TRUE}
+# Range from very negative to very positive sentiments per movie
+range(byMovie_SentimentEffect$weightSentiment)
+```
+
+This will be our sentiment-bias by movie and we will and also regularize it, since prevalence varies significantly among sentiments, but also compared to those movies with no sentiment assigned, which are majority.
+
+### Rating-related information
+Finally, we are going to explore some other variables we can extract from the timestamp information collected in each rating. We can easily convert it to date using `lubridate` package, and the determine if there are biases related with when exactly a rating is registered… Are ratings entered on Tuesday lower or higher that of weekends? Have winter months higher or lower ratings than summer ones? Does the “age” of a movie (how long ago was released when entering the rating) affect to the rating it gets? (or, for example, are just released movies rated higher/lower that older ones?)
+
+Let’s focus initially in the DAY OF THE WEEK by averaging ratings:
+
+```{r calcShowWeekday, echo=TRUE, message=FALSE, warning=FALSE}
+# ===============
+# WEEKDAY bias
+byWeekday_ratings <- edx %>%
+  mutate(WeekDay = factor(weekdays(as_datetime(edx$timestamp)))) %>%
+  group_by(WeekDay) %>%
+  summarize(b_wk = mean(rating) - mu, n=n(), Percent=round(100*b_wk/mu, digits = 2)) %>% 
+  arrange(Percent) %>% 
+  select(WeekDay, n, Percent)
+byWeekday_ratings
+```
+
+Although this effect is not very significant (always less than 0.5%), we see some bias, and with a prevalence very homogeneous, so we can consider this prescriptor for refining our model, despite it has not a big causation.
+
+Following a similar approach, we will dig now in the MONTH when the rating is done:
+
+```{r calcMonth, echo=TRUE, message=FALSE, warning=FALSE}
+# ===============
+# MONTH bias
+byMonth_ratings <- edx %>%
+  mutate(Month = month(as_datetime(timestamp), label = TRUE, abbr = FALSE)) %>%
+  group_by(Month) %>%
+  summarize(b_m = mean(rating) - mu, n=n(), Percent=round(100*b_m/mu, digits = 2)) %>% 
+  arrange(Percent) %>% 
+  select(Month, n, Percent)
+```
+
+```{r showByMonth, echo=FALSE, message=FALSE, warning=FALSE}
+# Explore month
+byMonth_ratings %>%
+  ggplot(aes(Month, Percent)) +
+  geom_point(color = "blue", size = 3) +
+  geom_hline(yintercept=0, linetype="dashed", color = "orange", size=2) +
+  geom_label_repel(aes(label = Month),
+                   label.size = NA,
+                   fill = "transparent",
+                   box.padding   = 0.65,
+                   point.padding = 0.5,
+                   segment.color = 'grey50') +
+  ggtitle("Ratings diff. to global average per month when done") +
+  theme(legend.position = "none",
+        panel.grid = element_blank(), axis.title.x = element_blank(),
+        axis.text.x = element_blank())
+```
+
+We appreciate now that Month has some significance as bias, since it shows in most cases month-effects higher than 0.5%, even closer to 1.5% in October. We will also consider this prescriptor for refinement of our modelling.
+
+Displaying prevalences of WeekDay and Month prescriptors we see approximately homogeneous distribution among categories:
+
+```{r echo=FALSE, message=FALSE, warning=FALSE, figures-side, out.width="50%"}
+# We check prevalence is approximately homogeneous for Weekday and Month. This will prevent us from the need of regularization
+# WeekDay distribution piechart
+pie(byWeekday_ratings$n,
+    labels = paste(byWeekday_ratings$WeekDay, sep = " ", round(byWeekday_ratings$n/10^6, digits = 2), "M"), 
+    col = rainbow(length(byWeekday_ratings$Percent)), 
+    main = "Volume of ratings by day of the week")
+# Month distribution piechart
+pie(byMonth_ratings$n,
+    labels = paste(byMonth_ratings$Month, sep = " ", round(byMonth_ratings$n/10^6, digits = 2), "M"), 
+    col = rainbow(length(byMonth_ratings$Percent)), 
+    main = "Volume of ratings by month")
+```
+
+Now we are going to analyze the difference in years between the exact moment when rating is registered and the release year of the movie, we’ll call this the AGE-AT-RATING. We previously extracted Year feature from the title of the movie. This code calculates this period of time in years, adding a filter to exclude Ages with not significant numbers of observations, which might behave as exceptional/outliers cases:
+
+```{r byAgeRatings, echo=TRUE, message=FALSE, warning=FALSE}
+# Explore AGE bias
+minRecords <- nrow(edx) / (5*100) # To avoid non-significant low prevalence cases, let's exclude ages with approx less than 5 times a theoretical equally shared distribution per age in years (considering 0 to 100 possible years of age)
+byAgeRating_ratings <-  edx %>%
+  mutate(YearRating = year(as_datetime(timestamp)), AgeAtRating = YearRating - year) %>%
+  group_by(AgeAtRating) %>%
+  summarize(b_ag = mean(rating) - mu, n=n(), Percent=100*b_ag/mu) %>%
+  filter(!is.na(AgeAtRating) & (AgeAtRating >= 0) & (n > minRecords)) %>%
+  arrange(desc(abs(Percent))) %>% select(AgeAtRating, n, Percent)
+```
+
+It graphically shows:
+
+```{r chartByAge, echo=FALSE, message=FALSE, warning=FALSE}
+# Visualize residuals over the movie's years
+chart_byAge <- byAgeRating_ratings %>% 
+  ggplot(aes(AgeAtRating, Percent, color=n)) +
+  geom_point(size = 3) +
+  geom_hline(yintercept=0, linetype="dashed", color = "orange", size=2) +
+  geom_smooth(method = "lm") + 
+  scale_x_reverse() +
+  ggtitle("Years between movie release and the moment user rates")
+chart_byAge
+```
+
+Looking at the chart, it seems clear that there is a bias here (more than 13% in some _ages_). Lowest ratings are assigned to movies 10 years old when rating, and in general movies are better rated when longer since rating moment. Despite chart seems similar to the Release Year prescriptor, it is important to distinguish that in this case we are assessing “how old” is the movie when the rating is registered. This can be significantly different than how old the movie is, since in first case depends on when the rating is created.
+
+As stated above, looking at the distributions of Weekday, Month and Age-at-Rating prescriptors, we see they are reasonably homogeneous, except for Age-At-Rating. However, for simplicity, and taking into consideration we are in a refinement phase will very small effect values and that we already filtered out Ages with few support, we will not proceed to regularize bias correction for these last three prescriptors, that will be modelled in a separate, ensembled model onto the Phase 1 Model.
+
+## Methods & Analysis
+In this section, we will explain the process and techniques used, including data cleaning, data exploration and visualization, insights gained, and your modeling approach.
+
+The prediction algorithm used in this project generally follows the simple model used in the course judging the “bias” or difference from the mean for each user, item, and genre and other prescriptors to finally implement a regularization to discount extreme, occasional values. This is performed in **two phases**.
+
+**Phase 1 model (based on user, movie data).** The prediction strategy followed departs from the basic estimation of the bias or statistical effect of user and movie. From this point, we add movie genre, movie year and sentiment/emotion extracted from the words title of the movie (positive/negative) to the set of categories to _unbias_, resulting in a regularized model including bias (“difference from the mean”) following features: user, movie, genre, year and sentiment.
+
+**Phase 2 model (based on Phase1 predictions and rating event data).** After obtaining a significantly improved `RMSE` using approach above, we still find an opportunity to reduce it. We will ensemble a second model to train, based on results of Phase 1, using prescriptors extracted from the “rating event”, i.e. when the rating is done (day of week, month and time in years between movie’s year and the rating event).
+
+### Phase 1 model
+The model used for developing the prediction algorithm follows this approach: the mean rating $\mu$ is modified by one or more _bias_ terms b with a residual error $\epsilon$ expected.
+
+```{r calculateMu, echo=TRUE}
+mu <- mean(edx$rating)  # We use mean 'mu' as starting point to advance in effects removal
+```
+
+$$ Y_{u,i,g,y,s} = \mu + b_i + b_u + b_g + b_y + b_s + \varepsilon_{i,u,g,y,s} $$
+
+According to above, we start with a trivial model based in predicting always de average. This results in a pretty high RMSE that we are going to progressively improve:
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+mean_RMSE <- RMSE(validation$rating, mu)  # Calculate RMSE
+mean_results <- data_frame(Method="Mean as base reference", RMSE = mean_RMSE) # Store value
+mean_results %>% knitr::kable(digits = 4) # Show results
+```
+
+#### Data preparation for improving prediction
+
+Since there are some prescriptors not explicitly present in our dataset, we need to do some preprocessing to allow availability of Year and Sentiment features.
+For the year, we extracted the four digits out of the movie’s title. This operation was done during initial phases of data preparation/partition.
+
+```{r}
+names(edx)
+```
+
+In order to assign sentiments for each movie, we use the title, extract words contained and thus we can, for some of them, assign positive/negative scores summarizes each movie’s detected emotions, based on BING public lexicon (collection of assignments between words and positive/negative semantic for each). During data exploration we learnt that this title word might be also a useful bias to discount, and created a dataframe to support this calculation. 
+
+The are several available lexicons, we are using the BING for simplicity, and based in the fact differences with other (NRC) that assign a wider range of emotions, will be not significant quantitatively. 
+
+```{r}
+head(bySentiment_ratings_bing)
+```
+
+#### Regularization
+
+Regularization penalizes records which stray far from the mean but have few associated ratings, such as an obscure film with only a few very low ratings. Following the derivation in the course, we can select the bias values using a regularization factor $\lambda$ as follows:
+
+$$\hat{b}_i(\lambda) = \frac{1}{\lambda + n_i} \sum_{i=1}^{n_i} \left(Y_{i,u,g} - \hat{\mu}\right)$$
+$$\hat{b}_u(\lambda) = \frac{1}{\lambda + n_u} \sum_{u=1}^{n_u} \left(Y_{i,u,g} - \hat{b}_i - \hat{\mu}\right)$$
+$$\hat{b}_g(\lambda) = \frac{1}{\lambda + n_g} \sum_{g=1}^{n_g} \left(Y_{i,u,g} - \hat{b}_i - \hat{b}_u - \hat{\mu}\right)$$
+
+$$\hat{b}_y(\lambda) = \frac{1}{\lambda + n_y} \sum_{y=1}^{n_y} \left(Y_{i,u,g,y} - \hat{b}_i - \hat{b}_u - \hat{b}_g - \hat{\mu}\right)$$
+
+$$\hat{b}_s(\lambda) = \frac{1}{\lambda + n_s} \sum_{s=1}^{n_s} \left(Y_{i,u,g,y,s} - \hat{b}_i - \hat{b}_u - \hat{b}_g - \hat{b_y} - \hat{\mu}\right)$$
+
+A key step for regularization is the $\lambda$ parameter estimation. We’ll do it iterating values to obtain a minimum. For this estimation it is necessary **we do not use and test data**, to prevent overfitting and based in a basic machine learning rule. So we need to separate two sub-partitions (`train_r2` and `test_r2`) from the general training set. Due to the relative precision our iterative approach offers, we do not need to use all the data set, we can reduce it and improve computability.
+
+```{r message=TRUE, warning=FALSE}
+# ==============
+# Let's separate our test dataset to a train+test to evaluate some parameters only against training
+# ==============
+devReduction <- 0.02 # Percentage of original data we extract for development
+set.seed(1, sample.kind="Rounding")
+reduced_index <- createDataPartition(y = edx$rating, times = 1, p = devReduction, list = FALSE)
+reduced_edx <- edx[reduced_index,]
+
+devSplit <- 0.2 # partition train::test
+set.seed(1, sample.kind="Rounding")
+reduced2_index <- createDataPartition(y = reduced_edx$rating, times = 1, p = devSplit, list = FALSE)
+
+edx_r2 <- reduced_edx[-reduced2_index,]
+temp <- reduced_edx[reduced2_index,]
+
+# Make sure userId and movieId in validation set are also in edx set
+validation_r2 <- temp %>%
+  semi_join(edx_r2, by = "movieId") %>%
+  semi_join(edx_r2, by = "userId")
+# Add rows removed from validation set back into edx set
+removed <- anti_join(temp, validation_r2)
+edx_r2 <- rbind(edx_r2, removed)
+rm(reduced_edx, reduced_index, reduced2_index, temp, removed, devReduction, devSplit)
+```
+
+Now we are ready to estimate best $\lambda$ to minimize RMSE in our reduced dataset. 
+
+```{r lambdaIteration, echo=TRUE, message=FALSE, warning=FALSE}
+lambdas <- seq(1, 10, 0.85)
+
+lRMSEs <- sapply(lambdas, function(l){
+  b_i <- edx_r2 %>%
+    group_by(movieId) %>%
+    summarize(b_i = sum(rating - mu)/(n()+l))
+  
+  b_u <- edx_r2 %>%
+    left_join(b_i, by="movieId") %>%
+    group_by(userId) %>%
+    summarize(b_u = sum(rating - b_i - mu)/(n()+l))
+  
+  b_g <- edx_r2 %>%
+    left_join(b_i, by="movieId") %>%
+    left_join(b_u, by="userId") %>%
+    group_by(genres) %>%
+    summarize(b_g = sum(rating - b_i - b_u - mu)/(n()+l))
+  
+  b_y <- edx_r2 %>%
+    left_join(b_i, by="movieId") %>%
+    left_join(b_u, by="userId") %>%
+    left_join(b_g, by="genres") %>%
+    group_by(year) %>%
+    summarize(b_y = sum(rating - b_i - b_u - b_g - mu)/(n()+l))
+  
+  predicted_ratings <- validation_r2 %>%
+    left_join(b_i, by = "movieId") %>%
+    left_join(b_u, by = "userId") %>%
+    left_join(b_g, by="genres") %>%
+    left_join(b_y, by = "year") %>%
+    mutate(pred = mu + b_i + b_u + b_g + b_y)
+  
+  return(RMSE(validation_r2$rating, predicted_ratings$pred))
+})
+```
+
+This RMSE result is not stored and it is not significant. It is only used to estimate best lambda. We see how a good $\lambda$ improves RMSE:
+
+```{r echo=FALSE}
+chartLambda <- ggplot() + aes(lambdas, lRMSEs) + geom_point() +
+  xlab('Lambda') + ylab("RMSE") + ggtitle("Lambda Tuning")
+chartLambda
+lambda <- lambdas[which.min(lRMSEs)]  # Now we know the optimal lambda value for regularization
+lambda
+```
+
+#### Training and prediction
+
+We have now our estimation for best $\lambda$, so we are ready to train our model. The idea is to apply all precalculated effects per category to each observation to predict, using $\mu$ (global ratings average) as base for the correction.
+
+Note that for computability, and taking into account that difference will be small, we will lightly simplify our model by:
+
+1) using alphabetical genres lists of each movie instead of the bias of combination of specific genres, and 
+
+2) use the BING lexicon for assessing sentiments derived from movie’s title, since this lexicon assigns only positive/negative instead of a longer set – these two sentiments covers and are implicitly linked to the longer list of emotions (in general converting each one to just positive or negative)
+
+```{r message=FALSE, warning=FALSE}
+# ==========
+# Training
+b_i <- edx %>%
+  group_by(movieId) %>%
+  summarize(b_i = sum(rating - mu)/(n()+lambda))
+
+b_u <- edx %>%
+  left_join(b_i, by="movieId") %>%
+  group_by(userId) %>%
+  summarize(b_u = sum(rating - b_i - mu)/(n()+lambda))
+
+b_g <- edx %>%
+  left_join(b_i, by="movieId") %>%
+  left_join(b_u, by="userId") %>%
+  group_by(genres) %>%
+  summarize(b_g = sum(rating - b_i - b_u - mu)/(n()+lambda))
+
+b_y <- edx %>%
+  left_join(b_i, by="movieId") %>%
+  left_join(b_u, by="userId") %>%
+  left_join(b_g, by="genres") %>%
+  group_by(year) %>%
+  summarize(b_y = sum(rating - b_i - b_u - b_g - mu)/(n()+lambda))
+
+b_sr <- (left_join(edx, byMovie_SentimentEffect, by="movieId")) %>%
+  left_join(b_i, by="movieId") %>%
+  left_join(b_u, by="userId") %>%
+  left_join(b_g, by="genres") %>%
+  left_join(b_y, by="year") %>%
+  group_by(movieId) %>%
+  summarize(b_sr = sum(rating - b_i - b_u - b_g - b_y - mu)/(n()+lambda))
+
+# ==========
+# Prediction
+predicted_ratings <- validation %>%
+  left_join(b_i, by = "movieId") %>%
+  left_join(b_u, by = "userId") %>%
+  left_join(b_g, by = "genres") %>%
+  left_join(b_y, by = "year") %>%
+  mutate(pred = mu + b_i + b_u + b_g + b_y)
+
+# ==========
+# Calculate and store RMSE
+mean_umgR_RMSE <- RMSE(validation$rating, predicted_ratings$pred)
+mean_results <- bind_rows(mean_results, data_frame(Method="Phase 1 (Regularized Mov+Usr+Gnr+Yr)", RMSE = mean_umgR_RMSE))
+```
+
+We have obtained a much better RMSE that just the average, or that the approach just user-movie shown in the course:
+
+```{r echo=FALSE, warning=FALSE}
+mean_results %>% knitr::kable(digits = 4)
+```
+
+### Phase 2 Model
+
+We will use predictions obtained in Phase 1 Model as base reference, instead of $\mu$, for discounting other biases: weekday, month, movie-age-at-rating. We need to prepare an extended version of the train and test datasets to have new features available:
+
+```{r}
+# Adding predicted rating (in Phase 1) and calculated time-related prescriptors 
+# (using timestamp as input)
+edx_ph2 <- edx %>%
+  left_join(b_i, by = "movieId") %>%
+  left_join(b_u, by = "userId") %>%
+  left_join(b_g, by = "genres") %>%
+  left_join(b_y, by = "year") %>%
+  mutate(WeekDay = factor(weekdays(as_datetime(edx$timestamp))),
+         Month = month(as_datetime(timestamp)),
+         AgeAtRating = year(as_datetime(timestamp)) - year,
+         unbiasedRating = mu + b_i + b_u + b_g + b_y)
+```
+
+And also need to extend predicted ratings from previous model with new features
+
+```{r}
+# Adding also to test set
+validation_ph2 <- predicted_ratings %>%
+  mutate(WeekDay = factor(weekdays(as_datetime(timestamp))),
+         Month = month(as_datetime(timestamp)),
+         AgeAtRating = year(as_datetime(timestamp)) - year)
+```
+
+We see regularization will not drive us to significant changes: as we visualized during data exploration, biases are so small and distribution of ratings per category so homogeneous for new prescriptors (WeekDay, Month, AgeAtRating), that it is not worthy to regularize. Instead, we´ll use **lambda2** as zero, though including parameter in the code for further developments if applicable.
+
+```{r lambda2Zero, echo=TRUE, message=FALSE, warning=FALSE}
+lambda2 <- 0
+```
+
+We are now ready to train and predict our model
+
+```{r runModel2, echo=TRUE, message=FALSE, warning=FALSE}
+# Training Phase 2 model
+b_w <- edx_ph2 %>%
+  group_by(WeekDay) %>%
+  summarize(b_w = sum(rating - unbiasedRating)/(n()+lambda2))
+
+b_m <- edx_ph2 %>%
+  left_join(b_w, by="WeekDay") %>%
+  group_by(Month) %>%
+  summarize(b_m = sum(rating - b_w - unbiasedRating)/(n()+lambda2))
+
+b_a <- edx_ph2 %>%
+  left_join(b_w, by="WeekDay") %>%
+  left_join(b_m, by="Month") %>%
+  group_by(AgeAtRating) %>%
+  summarize(b_a = sum(rating - b_w - b_m - unbiasedRating)/(n()+lambda2))
+
+# Prediction Phase 2 model
+# We add to initial predictions rating-time information
+validation_ph2 <- validation_ph2 %>%
+  left_join(b_w, by = "WeekDay") %>%
+  left_join(b_m, by = "Month") %>%
+  left_join(b_a, by = "AgeAtRating") %>% mutate(pred = pred + b_w + b_m + b_a)
+
+# Calculate and store RMSE
+mean_rMUGYT_RMSE <- RMSE(validation$rating, validation_ph2$pred)
+mean_results <- bind_rows(mean_results, data_frame(Method="Phase 2 (MUGY + TIME)", RMSE = mean_rMUGYT_RMSE))
+```
+
+We have finally ended our modelling obtaining a much better RMSE.
+
+## 4 Results
+
+We have got aa appretiable result just with Phase 1 Model, and in case we have event time data available for cases to predict, we will obtain even more improvement on RMSE. As a results sumamry, running the final algorithm of our modelling on the –validation– set yields the following rating:
+
+```{r showFinalResults, echo=FALSE, message=FALSE, warning=FALSE}
+mean_results %>% knitr::kable(digits = 4)
+```
+
+## 5 Conclusion
+
+We have implemented a model that starts in the usual application of movie and user effects on the observations average, but then adding some significant categories to refine predictions: Genre, Year and Sentiment extracted from the movie's title. After regularization of these biases, we reach and improved RMSE.
+
+Then We added a contribution to the model by ensembling a second (sequential, optional) model that refines first model predictions, based on Week Day, Month when rating is registered, and years difference between rating and release year of the movie. This again improves RMSE without need of regularization in this second case.
+
+Despite of the significant size of of the dataset for a local environment, it is also remarkable that this approach has no computability limitations, implementing a light approach in terms of performance requirements.
+
+Finally, we can mention some potential improvements for future versions:
+
+- Although impact is not very significant, there is a possibility to assess Genre-bias individually per Genre instead of as a set for each movie.
+
+- A _content based filtering_ based in matrices could be implemented for cases where we are predicting users with no previous ratings. However, given the size of dataset, this would probably mean a performance risk in a local environment.
+
+- There is a possibility to explore _collaborative based filtering_ methods implemented in package `RecommenderLab`: UBCF (User-Based Collaborative Filtering), IBCF (Item-Based Collaborative Filtering) or SVD (Singular Value Decomposition). Again, this approach is much more performance risk demanding.
+
+As a final conclusion, we can state we have reached challenge goal in terms of project requirements and RMSE for the validation set provided.
+
